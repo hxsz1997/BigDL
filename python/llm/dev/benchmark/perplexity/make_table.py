@@ -35,21 +35,18 @@ def make_table(result_dict):
     """Generate table of results."""
     md_writer = MarkdownTableWriter()
     latex_writer = LatexTableWriter()
-    md_writer.headers = ["Model", "Precision", "en", "zh"]
-    latex_writer.headers = ["Model", "Precision", "en", "zh"]
+    md_writer.headers = ["Model", "Precision", "ppl"]
+    latex_writer.headers = ["Model", "Precision", "ppl"]
 
-    languages = ["en", "zh"]
     values = []
     for model, model_results in result_dict.items():
         for precision, prec_results in model_results.items():
             value = [model, precision]
-            for language in languages:
-                task_results = prec_results.get(language, None)
-                if task_results is None:
-                    value.append("")
-                else:
-                    result = task_results["results"]
-                    value.append("%.4f" % result)
+            if prec_results is None:
+                value.append("")
+            else:
+                result = prec_results["results"]
+                value.append("%.4f" % result)
             values.append(value)
             model = ""    
             precision = ""
@@ -79,9 +76,7 @@ def merge_results(path):
                 result_dict = json.load(f)
             if model not in merged_results:
                 merged_results[model] = dict()
-            if precision not in merged_results[model]:
-                merged_results[model][precision] = dict()
-            merged_results[model][precision][language] = result_dict
+            merged_results[model][precision] = result_dict
     return merged_results
 
 
