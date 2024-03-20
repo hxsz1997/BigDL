@@ -73,37 +73,46 @@ def use_quantize_kv_cache(linear: torch.nn.Module, x: torch.Tensor) -> bool:
     if os.environ.get("BIGDL_QUANTIZE_KV_CACHE", None) is not None:
         return os.environ["BIGDL_QUANTIZE_KV_CACHE"] == "1"
     else:
-        return x.device.type == 'xpu' and get_xpu_device_type(x) == "mtl" \
+        return x.device.type == 'xpu' and kv_cache_device_check(x) \
             and hasattr(linear, "qtype") and \
             linear.qtype != ggml_tensor_qtype["fp16"] and linear.qtype != ggml_tensor_qtype["bf16"]
 
 
-def init_fp8_kv_cache(batch_size, num_heads, current_length, head_dim, device):
+def kv_cache_device_check(x: torch.Tensor) -> bool:
+    return get_xpu_device_type(x) == "mtl" or \
+        (get_xpu_device_type(x) == "arc" and 1 < x.size(0) and x.size(0) < 8)
+
+
+def init_fp8_kv_cache(batch_size, num_heads, current_length, head_dim, device, new_layout=False):
     max_length = current_length + FP8_KV_ALLOC_LENGTH
 
     k_cache_storage = torch.empty(batch_size, num_heads, max_length, head_dim,
                                   dtype=torch.uint8, device=device)
-
-    v_cache_storage = torch.empty(batch_size, num_heads, head_dim, max_length,
-                                  dtype=torch.uint8, device=device)
-
     k_cache = k_cache_storage.as_strided((batch_size, num_heads, 0, head_dim),
                                          k_cache_storage.stride(), storage_offset=0)
 
-    v_cache = v_cache_storage.as_strided((batch_size, num_heads, head_dim, 0),
-                                         v_cache_storage.stride(), storage_offset=0)
+    if new_layout:
+        v_cache_storage = torch.empty(batch_size, num_heads, max_length, head_dim,
+                                      dtype=torch.uint8, device=device)
+        v_cache = v_cache_storage.as_strided((batch_size, num_heads, 0, head_dim),
+                                             v_cache_storage.stride(), storage_offset=0)
+        return k_cache, v_cache
+    else:
+        v_cache_storage = torch.empty(batch_size, num_heads, head_dim, max_length,
+                                      dtype=torch.uint8, device=device)
+        v_cache = v_cache_storage.as_strided((batch_size, num_heads, head_dim, 0),
+                                             v_cache_storage.stride(), storage_offset=0)
+        return k_cache, v_cache.transpose(-1, -2)
 
-    return k_cache, v_cache.transpose(-1, -2)
 
-
-def append_fp8_kv_cache(k_cache, v_cache, key, value):
+def append_fp8_kv_cache(k_cache, v_cache, key, value, new_layout=False):
     batch_size, num_heads, cur_length, head_dim = k_cache.shape
     new_length = cur_length + key.size(2)
     new_size = (batch_size, num_heads, new_length, head_dim)
 
     if k_cache.stride(1) < new_length * k_cache.size(3):
         new_k_cache, new_v_cache = init_fp8_kv_cache(batch_size, num_heads, new_length,
-                                                     head_dim, key.device)
+                                                     head_dim, key.device, new_layout)
         new_k_cache = new_k_cache.as_strided(new_size, new_k_cache.stride(), storage_offset=0)
         new_v_cache = new_v_cache.as_strided(new_size, new_v_cache.stride(), storage_offset=0)
         new_k_cache[:, :, :cur_length, :] = k_cache
@@ -178,7 +187,7 @@ def apply_ipex_rotate_every_two(q, k, cos, sin):
         torch.ops.torch_ipex.apply_rotary_embedding(k, sin, cos, k)
 
 
-def apply_rotary_pos_emb_no_cache_xpu(q, k, position_ids, model_family):
+def apply_rotary_pos_emb_no_cache_xpu(q, k, position_ids, model_family, rope_theta=10000.0):
     if q.device.type != "xpu":
         invalidInputError(False,
                           f"only xpu is supported in this function")
@@ -187,7 +196,8 @@ def apply_rotary_pos_emb_no_cache_xpu(q, k, position_ids, model_family):
     k_embed = torch.empty(k.shape, dtype=k.dtype, device=k.device)
     if model_family in ["llama", "baichuan", "internlm", "aquila", "gpt_neox", "mistral",
                         "mixtral"]:
-        linear_q4_0.apply_rotary_embedding_half_q_and_k(q, k, position_ids, q_embed, k_embed)
+        linear_q4_0.apply_rotary_embedding_half_q_and_k(q, k, position_ids,
+                                                        q_embed, k_embed, rope_theta)
         return q_embed, k_embed
     else:
         invalidInputError(False,
@@ -353,10 +363,7 @@ def use_fused_layer_norm(x: torch.Tensor, training: bool):
         not training
         and not x.requires_grad
         and device in ["arc", "flex", "pvc", "mtl"]  # fused layer norm cannot run on UHD
-        and (
-            device == "mtl"  # fused layer norm conflicts with XMX, so disable it when using XMX
-            or x.numel() // x.size(-1) == 1
-        )
+        and x.numel() // x.size(-1) == 1  # fused layer norm is slower in first token
     )
 
 

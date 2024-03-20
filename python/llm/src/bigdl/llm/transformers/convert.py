@@ -211,6 +211,11 @@ def _replace_with_low_bit_linear(model, qtype, modules_to_not_convert=None,
             if (not any(key in ".".join(current_key_name) for key in modules_to_not_convert) and
                     not isinstance(module, LowBitLinear)):
                 in_features, out_features, mp_group = linear_args
+                optimize_lm_head = False
+                if name == "lm_head":
+                    if model_type in ["gptj", "llama"] and os.environ.get("BIGDL_OPTIMIZE_LM_HEAD",
+                                                                          None) == "1":
+                        optimize_lm_head = True
                 with init_empty_weights():
                     new_linear = None
                     is_gptq = is_auto_gptq_available() and isinstance(module, QuantLinearCudaOld)
@@ -225,6 +230,7 @@ def _replace_with_low_bit_linear(model, qtype, modules_to_not_convert=None,
                             bias=has_bias,
                             mp_group=mp_group,
                             enable_xetla=enable_xetla,
+                            optimize_lm_head=optimize_lm_head
                         )
                         device = module.qweight.data.device
                         invalidInputError(device.type != "meta",
@@ -253,6 +259,7 @@ def _replace_with_low_bit_linear(model, qtype, modules_to_not_convert=None,
                             module.bias is not None,
                             mp_group=mp_group,
                             enable_xetla=enable_xetla,
+                            optimize_lm_head=optimize_lm_head
                         )
                         cur_qtype, cur_imatrix = get_cur_qtype_and_imatrix(qtype,
                                                                            full_module_name,
@@ -280,6 +287,7 @@ def _replace_with_low_bit_linear(model, qtype, modules_to_not_convert=None,
                             out_features,
                             module.bias is not None,
                             mp_group=mp_group,
+                            optimize_lm_head=optimize_lm_head
                         )
                         device = module.weight.data.device
                         from bigdl.llm.transformers.utils import get_ipex_version
@@ -301,6 +309,7 @@ def _replace_with_low_bit_linear(model, qtype, modules_to_not_convert=None,
                             out_features,
                             module.bias is not None,
                             mp_group=mp_group,
+                            optimize_lm_head=optimize_lm_head
                         )
                         device = module.weight.data.device
                         # convert here
@@ -529,6 +538,7 @@ def _optimize_pre(model):
     # for rwkv models (verified RWKV/rwkv-4-world-7b)
     if model.config.model_type == "rwkv":
         model.rwkv._rescale_layers()
+        model.rwkv.layers_are_rescaled = True
     # process NormHead module in Baichuan2 7B and 13B
     if model.config.model_type == "baichuan" and model.config.vocab_size == 125696:
         # NormHead do normalization on the weights just once at inference time.
@@ -580,6 +590,48 @@ def _optimize_pre(model):
                 del module.q_proj
                 del module.k_proj
         model.apply(merge_qk_proj_func)
+    # for bge-large
+    if model.config.model_type == 'bert' and (
+        not model.config.is_decoder and
+        model.config.position_embedding_type == "absolute"
+    ):
+        from bigdl.llm.transformers.models.bert import merge_qkv
+        model.apply(merge_qkv)
+    if model.config.model_type == "qwen":
+        position_ids = torch.arange(0, model.config.max_position_embeddings)
+        rope_base = model.config.rotary_emb_base
+        from accelerate.big_modeling import init_empty_weights
+
+        def split_qkv_proj_func(module):
+            if "QWenAttention" in module.__class__.__name__:
+                c_attn_weight = module.c_attn.weight.data
+                c_attn_bias = module.c_attn.bias.data
+                projection_size = module.projection_size
+                hid_size = module.hidden_size
+                with init_empty_weights():
+                    q_proj = torch.nn.Linear(hid_size, projection_size)
+                    k_proj = torch.nn.Linear(hid_size, projection_size)
+                    v_proj = torch.nn.Linear(hid_size, projection_size)
+                if not model.config.to_dict().get("bigdl_transformers_low_bit", False):
+                    q_proj.weight = torch.nn.Parameter(
+                        c_attn_weight[:projection_size, :], requires_grad=False)
+                    q_proj.bias = torch.nn.Parameter(
+                        c_attn_bias[:projection_size], requires_grad=False)
+                    k_proj.weight = torch.nn.Parameter(
+                        c_attn_weight[projection_size: 2 * projection_size, :], requires_grad=False)
+                    k_proj.bias = torch.nn.Parameter(
+                        c_attn_bias[projection_size: 2 * projection_size], requires_grad=False)
+                    v_proj.weight = torch.nn.Parameter(
+                        c_attn_weight[2 * projection_size:, :], requires_grad=False)
+                    v_proj.bias = torch.nn.Parameter(
+                        c_attn_bias[2 * projection_size:], requires_grad=False)
+                module.q_proj = q_proj
+                module.k_proj = k_proj
+                module.v_proj = v_proj
+                module.position_ids = position_ids
+                module.rope_base = rope_base
+                del module.c_attn
+        model.apply(split_qkv_proj_func)
     return model
 
 
@@ -596,13 +648,10 @@ def ggml_convert_low_bit(model, qtype, optimize_model=True,
     modules_to_not_convert = [] if modules_to_not_convert is None else modules_to_not_convert
 
     # using ipex optimizer before changing to bigdl linear
-    _enable_ipex = os.getenv("BIGDL_OPT_IPEX")
-    _enable_ipex = (_enable_ipex is not None) and (_enable_ipex.lower() == "true")
-    _enable_ipex = _enable_ipex and (qtype == ggml_tensor_qtype["bf16"])
-    if (device == "cpu") and (qtype == ggml_tensor_qtype["bf16"]):
-        logger.info(f"BIGDL_OPT_IPEX: {_enable_ipex}")
+    _enable_ipex = get_enable_ipex()
+
     if _enable_ipex:
-        model = _optimize_ipex(model)
+        model = _optimize_ipex(model, qtype)
         return model
 
     if optimize_model:
@@ -641,6 +690,24 @@ def ggml_convert_low_bit(model, qtype, optimize_model=True,
 
     if optimize_model:
         model = _optimize_post(model, lightweight_bmm)
+
+    if hasattr(model, "config") and \
+            model.config.model_type == "qwen" and hasattr(model.config, "visual"):
+        # for Qwen-VL-Chat
+        # Due to issue https://github.com/intel/intel-extension-for-pytorch/issues/454,
+        # currently put interpolation execution into cpu
+        visual_module_name = model.transformer.visual.__class__.__module__
+        visual_module = importlib.import_module(visual_module_name)
+        from bigdl.llm.transformers.models.qwen_vl import qwen_vl_vision_transformer_forward
+        from bigdl.llm.transformers.models.qwen_vl import qwen_vl_resampler_forward
+        convert_forward(model,
+                        visual_module.VisionTransformer,
+                        qwen_vl_vision_transformer_forward
+                        )
+        convert_forward(model,
+                        visual_module.Resampler,
+                        qwen_vl_resampler_forward
+                        )
     return model
 
 
@@ -671,12 +738,19 @@ def replace_func(m, target_m, func_name, new_func):
         replace_func(sub_m, target_m, func_name, new_func)
 
 
-def _optimize_ipex(model):
+def get_enable_ipex():
+    _enable_ipex = os.getenv("BIGDL_OPT_IPEX")
+    _enable_ipex = (_enable_ipex is not None) and (_enable_ipex.lower() == "true")
+    return _enable_ipex
+
+
+def _optimize_ipex(model, qtype=ggml_tensor_qtype["bf16"]):
+    import intel_extension_for_pytorch as ipex
     from intel_extension_for_pytorch.transformers.optimize import model_convert_reference
     from transformers.modeling_attn_mask_utils import AttentionMaskConverter
     from bigdl.llm.transformers.convert_ipex import (
         _ipex_optimize_model, _ipex_jit, _make_causal_mask,
-        _llama_model_forward_4_35, convert_function, GLM_get_masks
+        _llama_model_forward_4_35, convert_function, GLM_get_masks,
     )
 
     model = model_convert_reference(model)
@@ -703,7 +777,7 @@ def _optimize_ipex(model):
         # baichuan2
         rms_classes.append(type(model.model.layers[0].input_layernorm))
 
-    _ipex_optimize_model(model, rms_classes)
+    model = _ipex_optimize_model(model, rms_classes, qtype)
     return _ipex_jit(model)
 
 
@@ -715,6 +789,7 @@ def _optimize_post(model, lightweight_bmm=False):
     from bigdl.llm.transformers.models.llama import llama_rms_norm_forward
     from bigdl.llm.transformers.models.llama import llama_mlp_forward
     from bigdl.llm.transformers.models.llama import llama_decoder_forward
+    from bigdl.llm.transformers.models.llama import llama_model_forward
     from transformers.modeling_utils import PreTrainedModel
 
     # All huggingface format models are inherited from `PreTrainedModel`
@@ -768,6 +843,11 @@ def _optimize_post(model, lightweight_bmm=False):
                     transformers.models.llama.modeling_llama.LlamaAttention,
                     llama_attention_selective_batching_forward_4_31,
                 )
+            else:
+                convert_forward(
+                    model,
+                    transformers.models.llama.modeling_llama.LlamaModel,
+                    llama_model_forward)
     else:
         # todo implement 4.28.0 ~ 4.30.2
         pass
@@ -888,7 +968,7 @@ def _optimize_post(model, lightweight_bmm=False):
 
     elif model.config.model_type == "baichuan" and model.config.vocab_size == 125696:
         # baichuan2
-        if model.config.hidden_size == 4096:
+        if model.config.hidden_size in [4096, 2048]:
             # baichuan2-7B
             modeling_module_name = model.__class__.__module__
             module = importlib.import_module(modeling_module_name)
@@ -1003,6 +1083,7 @@ def _optimize_post(model, lightweight_bmm=False):
             from bigdl.llm.transformers.models.qwen import qwen_attention_forward
             from bigdl.llm.transformers.models.qwen import qwen_mlp_forward
             from bigdl.llm.transformers.models.chatglm2 import chatglm_rms_norm_forward
+            from bigdl.llm.transformers.models.qwen import qwen_model_forward
             convert_forward(model,
                             module.QWenAttention,
                             qwen_attention_forward
@@ -1013,6 +1094,9 @@ def _optimize_post(model, lightweight_bmm=False):
             convert_forward(model,
                             module.QWenMLP,
                             qwen_mlp_forward)
+            convert_forward(model,
+                            module.QWenModel,
+                            qwen_model_forward)
     elif model.config.model_type == "qwen2":
         # for Qwen1.5-7B
         modeling_module_name = model.__class__.__module__
@@ -1023,15 +1107,14 @@ def _optimize_post(model, lightweight_bmm=False):
                         module.Qwen2Model,
                         qwen2_model_forward)
         convert_forward(model,
-                        module.Qwen2Attention,
-                        qwen2_attention_forward
-                        )
-        convert_forward(model,
                         module.Qwen2RMSNorm,
                         llama_rms_norm_forward)
         convert_forward(model,
                         module.Qwen2MLP,
                         llama_mlp_forward)
+        convert_forward(model,
+                        module.Qwen2Attention,
+                        qwen2_attention_forward)
     elif model.config.model_type == "aquila":
         modeling_module_name = model.__class__.__module__
         module = importlib.import_module(modeling_module_name)
@@ -1064,7 +1147,9 @@ def _optimize_post(model, lightweight_bmm=False):
         convert_forward(model,
                         module.MixtralBLockSparseTop2MLP,
                         mixtral_mlp_forward)
-    elif model.config.model_type == "phi-msft":
+    elif model.config.model_type == "phi-msft" and \
+            hasattr(model.config, "num_local_experts"):
+        # For phixtral, limit the condition to avoid applying on phi-2 hosted by ModelScope
         modeling_module_name = model.__class__.__module__
         module = importlib.import_module(modeling_module_name)
         from bigdl.llm.transformers.models.phixtral import phixtral_moeblock_forward, \
@@ -1092,9 +1177,14 @@ def _optimize_post(model, lightweight_bmm=False):
                 modeling_module_name = model.__class__.__module__
                 module = importlib.import_module(modeling_module_name)
                 from bigdl.llm.transformers.models.mistral import mistral_attention_forward_4_36
+                from bigdl.llm.transformers.models.mistral import mistral_model_forward_4_36
                 convert_forward(model,
                                 module.MistralAttention,
                                 mistral_attention_forward_4_36
+                                )
+                convert_forward(model,
+                                module.MistralModel,
+                                mistral_model_forward_4_36
                                 )
                 convert_forward(model,
                                 module.MistralRMSNorm,
@@ -1223,4 +1313,19 @@ def _optimize_post(model, lightweight_bmm=False):
         #                 module.YuanMLP,
         #                 yuan_mlp_forward
         #                 )
+    elif model.config.model_type == 'bert' and (
+        not model.config.is_decoder and
+        model.config.position_embedding_type == "absolute"
+    ):
+        modeling_module_name = model.__class__.__module__
+        module = importlib.import_module(modeling_module_name)
+        from bigdl.llm.transformers.models.bert import self_attention_forward
+        from bigdl.llm.transformers.models.bert import encoder_forward
+        convert_forward(model,
+                        module.BertSelfAttention,
+                        self_attention_forward)
+        convert_forward(model,
+                        module.BertEncoder,
+                        encoder_forward)
+
     return model

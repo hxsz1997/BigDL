@@ -37,7 +37,7 @@ from bigdl.llm.utils.common.log4Error import invalidInputError
 LLAMA_IDS = ['meta-llama/Llama-2-7b-chat-hf','meta-llama/Llama-2-13b-chat-hf',
              'meta-llama/Llama-2-70b-chat-hf','decapoda-research/llama-7b-hf',
              'decapoda-research/llama-65b-hf','lmsys/vicuna-7b-v1.5',
-             'lmsys/vicuna-13b-v1.3','project-baize/merged-baize-30b']
+             'lmsys/vicuna-13b-v1.3','lmsys/vicuna-33b-v1.3','project-baize/merged-baize-30b']
 
 CHATGLM_IDS = ['THUDM/chatglm-6b', 'THUDM/chatglm2-6b', 'THUDM/chatglm3-6b']
 
@@ -86,12 +86,22 @@ def run_model(repo_id, test_api, in_out_pairs, local_model_hub=None, warm_up=1, 
         result = run_deepspeed_transformer_int4_cpu(repo_id, local_model_hub, in_out_pairs, warm_up, num_trials, num_beams, low_bit, batch_size)
     elif test_api == 'transformer_int4_gpu_win':
         result = run_transformer_int4_gpu_win(repo_id, local_model_hub, in_out_pairs, warm_up, num_trials, num_beams, low_bit, cpu_embedding, batch_size, streaming)
+    elif test_api == 'transformer_int4_fp16_gpu_win':
+        result = run_transformer_int4_fp16_gpu_win(repo_id, local_model_hub, in_out_pairs, warm_up, num_trials, num_beams, low_bit, cpu_embedding, batch_size, streaming)
     elif test_api == 'transformer_int4_loadlowbit_gpu_win':
         # drop the results of the first time for better performance
         run_transformer_int4_loadlowbit_gpu_win(repo_id, local_model_hub, in_out_pairs, warm_up, num_trials, num_beams, low_bit, cpu_embedding, batch_size, streaming)
         result = run_transformer_int4_loadlowbit_gpu_win(repo_id, local_model_hub, in_out_pairs, warm_up, num_trials, num_beams, low_bit, cpu_embedding, batch_size, streaming)
     elif test_api == 'transformer_autocast_bf16':
         result = run_transformer_autocast_bf16(repo_id, local_model_hub, in_out_pairs, warm_up, num_trials, num_beams, batch_size)
+    elif test_api == 'bigdl_ipex_bf16':
+        result = run_bigdl_ipex_bf16(repo_id, local_model_hub, in_out_pairs, warm_up, num_trials, num_beams, batch_size)
+    elif test_api == 'bigdl_ipex_int4':
+        result = run_bigdl_ipex_int4(repo_id, local_model_hub, in_out_pairs, warm_up, num_trials, num_beams, batch_size)
+    elif test_api == 'bigdl_ipex_int8':
+        result = run_bigdl_ipex_int8(repo_id, local_model_hub, in_out_pairs, warm_up, num_trials, num_beams, batch_size)
+    elif test_api == 'deepspeed_optimize_model_gpu':
+        result = run_deepspeed_optimize_model_gpu(repo_id, local_model_hub, in_out_pairs, warm_up, num_trials, num_beams, low_bit, batch_size)
 
     for in_out_pair in in_out_pairs:
         if result and result[in_out_pair]:
@@ -107,7 +117,7 @@ def run_model(repo_id, test_api, in_out_pairs, local_model_hub=None, warm_up=1, 
                             low_bit,
                             cpu_embedding if 'win' in test_api else 'N/A',
                             round(result[in_out_pair][-1][5], 2),
-                            result[in_out_pair][-1][6] if 'int4_gpu' in test_api or 'int4_loadlowbit_gpu' in test_api else 'N/A',
+                            result[in_out_pair][-1][6] if any(keyword in test_api for keyword in ['int4_gpu', 'int4_fp16_gpu_win', 'int4_loadlowbit_gpu' ]) else 'N/A',
                             streaming if 'win' in test_api else 'N/A'],
                             ) 
 
@@ -398,15 +408,19 @@ def run_transformer_int4_gpu(repo_id,
         tokenizer = LlamaTokenizer.from_pretrained(model_path, trust_remote_code=True)
         model = model.to('xpu')
     else:
-        if 'starcoder' in repo_id:
-            # Load starcoder-15.5b model in bf16 format to avoid CPU OOM. 
-            model = AutoModelForCausalLM.from_pretrained(model_path, optimize_model=True, load_in_low_bit=low_bit,
-                                                        trust_remote_code=True, use_cache=True, torch_dtype=torch.bfloat16).eval()
-            # Convert the low-bit model back to fp32 for performance considerations.
-            model = model.float()
+        if "4bit" in repo_id:
+            model = AutoModelForCausalLM.load_low_bit(model_path, optimize_model=True,
+                                            trust_remote_code=True, use_cache=True).eval()
         else:
-            model = AutoModelForCausalLM.from_pretrained(model_path, optimize_model=True, load_in_low_bit=low_bit,
-                                                        trust_remote_code=True, use_cache=True).eval()
+            if 'starcoder' in repo_id:
+                # Load starcoder-15.5b model in bf16 format to avoid CPU OOM.
+                model = AutoModelForCausalLM.from_pretrained(model_path, optimize_model=True, load_in_low_bit=low_bit,
+                                                            trust_remote_code=True, use_cache=True, torch_dtype=torch.bfloat16).eval()
+                # Convert the low-bit model back to fp32 for performance considerations.
+                model = model.float()
+            else:
+                model = AutoModelForCausalLM.from_pretrained(model_path, optimize_model=True, load_in_low_bit=low_bit,
+                                                            trust_remote_code=True, use_cache=True).eval()
         tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         model = model.to('xpu')
         if isinstance(model, GPTJForCausalLM):
@@ -900,6 +914,116 @@ def run_transformer_int4_gpu_win(repo_id,
     return result
 
 
+def run_transformer_int4_fp16_gpu_win(repo_id,
+                                      local_model_hub,
+                                      in_out_pairs,
+                                      warm_up,
+                                      num_trials,
+                                      num_beams,
+                                      low_bit,
+                                      cpu_embedding,
+                                      batch_size,
+                                      streaming):
+    from bigdl.llm.transformers import AutoModel, AutoModelForCausalLM
+    from transformers import AutoTokenizer, GPTJForCausalLM, LlamaTokenizer, TextStreamer
+    import intel_extension_for_pytorch as ipex
+    model_path = get_model_path(repo_id, local_model_hub)
+    # Load model in 4 bit,
+    # which convert the relevant layers in the model into INT4 format
+    st = time.perf_counter()
+    if repo_id in CHATGLM_IDS:
+        model = AutoModel.from_pretrained(model_path, load_in_low_bit=low_bit, optimize_model=True,
+                                          trust_remote_code=True, use_cache=True, cpu_embedding=cpu_embedding).eval()
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        model = model.half()
+        model = model.to('xpu')
+    elif repo_id in LLAMA_IDS:
+        model = AutoModelForCausalLM.from_pretrained(model_path, load_in_low_bit=low_bit, optimize_model=True,
+                                                     trust_remote_code=True, use_cache=True, cpu_embedding=cpu_embedding).eval()
+        tokenizer = LlamaTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        model = model.half()
+        model = model.to('xpu')
+    elif repo_id in LLAVA_IDS:
+        llava_repo_dir = os.environ.get('LLAVA_REPO_DIR')
+        sys.path.append(rf"{llava_repo_dir}")
+        from llava.model.language_model.llava_llama import LlavaLlamaForCausalLM
+        model = AutoModelForCausalLM.from_pretrained(model_path, load_in_low_bit=low_bit, optimize_model=True,
+                                          trust_remote_code=True, use_cache=True, cpu_embedding=cpu_embedding).eval()
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        model = model.half()
+        model = model.to('xpu')
+    else:
+        model = AutoModelForCausalLM.from_pretrained(model_path, optimize_model=True, load_in_low_bit=low_bit,
+                                                     trust_remote_code=True, use_cache=True, cpu_embedding=cpu_embedding).eval()
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        model = model.half()
+        model = model.to('xpu')
+        if isinstance(model, GPTJForCausalLM):
+            # For gpt-j model family, this optimization can provide a better performance.
+            model = ipex.optimize(model.eval(), inplace=True)
+    end = time.perf_counter()
+    load_time = end - st
+    print(">> loading of model costs {}s and {}GB".format(load_time, torch.xpu.memory.memory_reserved()/(1024**3)))
+
+    model = BenchmarkWrapper(model)
+    streamer = TextStreamer(tokenizer, skip_prompt=True)
+
+    result = {}
+    with torch.inference_mode():
+        for in_out in in_out_pairs:
+            try:
+                in_out_len = in_out.split("-")
+                in_len = int(in_out_len[0])
+                out_len = int(in_out_len[1])
+                # As different tokenizer has different encodings,
+                # in_len.txt maybe shorter than we need,
+                # use much longer context to make sure input length
+                test_length = min(in_len*2, 8192)
+                while test_length not in [32, 256, 1024, 2048, 8192]:
+                    test_length = test_length * 2
+                input_str = open(f"prompt/{test_length}.txt", 'r').read()
+                # As different tokenizer has different encodings,
+                # slice the input_ids to ensure the prompt length is required length.
+                input_ids = tokenizer.encode(input_str, return_tensors="pt")
+                input_ids = input_ids[:, :in_len]
+                true_str = tokenizer.batch_decode(input_ids)[0]
+                input_list = [true_str] * batch_size
+                input_ids = tokenizer(input_list, return_tensors="pt").input_ids.to('xpu')
+                actual_in_len = input_ids.shape[1]
+                result[in_out] = []
+                for i in range(num_trials + warm_up):
+                    st = time.perf_counter()
+                    if streaming:
+                        output_ids = model.generate(input_ids, do_sample=False, max_new_tokens=out_len,
+                                                    num_beams=num_beams, streamer=streamer)
+                    else:
+                        output_ids = model.generate(input_ids, do_sample=False, max_new_tokens=out_len,
+                                                    num_beams=num_beams)
+                    torch.xpu.synchronize()
+                    end = time.perf_counter()
+                    output_ids = output_ids.cpu()
+                    print("model generate cost: " + str(end - st))
+                    output = tokenizer.batch_decode(output_ids)
+                    if not streaming:
+                        print(output[0])
+                    actual_out_len = output_ids.shape[1] - actual_in_len
+                    if i >= warm_up:
+                        result[in_out].append([model.first_cost, model.rest_cost_mean, model.encoder_time,
+                                               actual_in_len, actual_out_len, load_time, model.peak_memory])
+                    # torch.xpu.empty_cache() # this may make first token slower
+            except RuntimeError:
+                traceback.print_exc()
+                pass
+            torch.xpu.synchronize()
+            torch.xpu.empty_cache()
+    model.to('cpu')
+    torch.xpu.synchronize()
+    torch.xpu.empty_cache()
+    del model
+    gc.collect()
+    return result
+
+
 def run_transformer_int4_loadlowbit_gpu_win(repo_id,
                                             local_model_hub,
                                             in_out_pairs,
@@ -1072,6 +1196,332 @@ def run_transformer_autocast_bf16( repo_id,
                     result[in_out].append([model.first_cost, model.rest_cost_mean, model.encoder_time,
                                           actual_in_len, actual_out_len, load_time])
     return result
+
+
+def run_bigdl_ipex_bf16(repo_id,
+                    local_model_hub,
+                    in_out_pairs,
+                    warm_up,
+                    num_trials,
+                    num_beams,
+                    batch_size):
+    from bigdl.llm.transformers import AutoModel, AutoModelForCausalLM
+    from transformers import AutoTokenizer, LlamaTokenizer
+
+    os.environ["BIGDL_OPT_IPEX"] = "true"
+
+    model_path = get_model_path(repo_id, local_model_hub)
+    # Load model in bf16,
+    # which convert the relevant layers in the model into BF16 format
+    st = time.perf_counter()
+    if repo_id in CHATGLM_IDS:
+        model = AutoModel.from_pretrained(model_path, load_in_low_bit='bf16', trust_remote_code=True, torch_dtype=torch.bfloat16,
+                                          use_cache=True, torchscript=True)
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    elif repo_id in LLAMA_IDS:
+        model = AutoModelForCausalLM.from_pretrained(model_path, load_in_low_bit='bf16', trust_remote_code=True, torch_dtype=torch.bfloat16,
+                                                     use_cache=True, torchscript=True)
+        tokenizer = LlamaTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(model_path, load_in_low_bit='bf16', trust_remote_code=True, torch_dtype=torch.bfloat16,
+                                                     use_cache=True, torchscript=True)
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    if not hasattr(model.config, "token_latency"):
+        model.config.token_latency = True
+    end = time.perf_counter()
+    load_time = end - st
+    print(">> loading of model costs {}s".format(load_time))
+
+    result = {}
+    with torch.inference_mode(), torch.autocast("cpu"):
+        for in_out in in_out_pairs:
+            in_out_len = in_out.split("-")
+            in_len = int(in_out_len[0])
+            out_len = int(in_out_len[1])
+            # As different tokenizer has different encodings,
+            # in_len.txt maybe shorter than we need,
+            # use much longer context to make sure input length
+            test_length = min(in_len*2, 8192)
+            while test_length not in [32, 256, 1024, 2048, 8192]:
+                test_length = test_length * 2
+            input_str = open(f"prompt/{test_length}.txt", 'r').read()
+            # As different tokenizer has different encodings,
+            # slice the input_ids to ensure the prompt length is required length.
+            input_ids = tokenizer.encode(input_str, return_tensors="pt")
+            input_ids = input_ids[:, :in_len]
+            true_str = tokenizer.batch_decode(input_ids)[0]
+            input_list = [true_str] * batch_size
+            input_ids = tokenizer(input_list, return_tensors="pt").input_ids
+            actual_in_len = input_ids.shape[1]
+            result[in_out] = []
+            for i in range(num_trials + warm_up):
+                st = time.perf_counter()
+                output_ids, total_list = model.generate(input_ids, do_sample=False, max_new_tokens=out_len,
+                                            num_beams=num_beams)
+                end = time.perf_counter()
+                print("model generate cost: " + str(end - st))
+                output = tokenizer.batch_decode(output_ids)
+                print(output[0])
+                actual_out_len = output_ids.shape[1] - actual_in_len
+                if i >= warm_up:
+                    result[in_out].append([total_list[0], np.mean(total_list[1:]), 0,
+                                          actual_in_len, actual_out_len, load_time])
+    return result
+
+
+def run_bigdl_ipex_int4(repo_id,
+                    local_model_hub,
+                    in_out_pairs,
+                    warm_up,
+                    num_trials,
+                    num_beams,
+                    batch_size):
+    from bigdl.llm.transformers import AutoModel, AutoModelForCausalLM
+    from transformers import AutoTokenizer, LlamaTokenizer
+
+    os.environ["BIGDL_OPT_IPEX"] = "true"
+
+    model_path = get_model_path(repo_id, local_model_hub)
+
+    st = time.perf_counter()
+    if repo_id in CHATGLM_IDS:
+        model = AutoModel.from_pretrained(model_path, load_in_low_bit='sym_int4', trust_remote_code=True, torch_dtype='auto',
+                                          use_cache=True, torchscript=True)
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    elif repo_id in LLAMA_IDS:
+        model = AutoModelForCausalLM.from_pretrained(model_path, load_in_low_bit='sym_int4', trust_remote_code=True, torch_dtype='auto',
+                                                     use_cache=True, torchscript=True)
+        tokenizer = LlamaTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(model_path, load_in_low_bit='sym_int4', trust_remote_code=True, torch_dtype='auto',
+                                                     use_cache=True, torchscript=True)
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    if not hasattr(model.config, "token_latency"):
+        model.config.token_latency = True
+    end = time.perf_counter()
+    load_time = end - st
+    print(">> loading of model costs {}s".format(load_time))
+
+    result = {}
+    with torch.inference_mode(), torch.autocast("cpu"):
+        for in_out in in_out_pairs:
+            in_out_len = in_out.split("-")
+            in_len = int(in_out_len[0])
+            out_len = int(in_out_len[1])
+            # As different tokenizer has different encodings,
+            # in_len.txt maybe shorter than we need,
+            # use much longer context to make sure input length
+            test_length = min(in_len*2, 8192)
+            while test_length not in [32, 256, 1024, 2048, 8192]:
+                test_length = test_length * 2
+            input_str = open(f"prompt/{test_length}.txt", 'r').read()
+            # As different tokenizer has different encodings,
+            # slice the input_ids to ensure the prompt length is required length.
+            input_ids = tokenizer.encode(input_str, return_tensors="pt")
+            input_ids = input_ids[:, :in_len]
+            true_str = tokenizer.batch_decode(input_ids)[0]
+            input_list = [true_str] * batch_size
+            input_ids = tokenizer(input_list, return_tensors="pt").input_ids
+            actual_in_len = input_ids.shape[1]
+            result[in_out] = []
+            for i in range(num_trials + warm_up):
+                st = time.perf_counter()
+                output_ids, total_list = model.generate(input_ids, do_sample=False, max_new_tokens=out_len,
+                                            num_beams=num_beams)
+                end = time.perf_counter()
+                print("model generate cost: " + str(end - st))
+                output = tokenizer.batch_decode(output_ids)
+                print(output[0])
+                actual_out_len = output_ids.shape[1] - actual_in_len
+                if i >= warm_up:
+                    result[in_out].append([total_list[0], np.mean(total_list[1:]), 0,
+                                          actual_in_len, actual_out_len, load_time])
+    return result
+
+
+def run_bigdl_ipex_int8(repo_id,
+                    local_model_hub,
+                    in_out_pairs,
+                    warm_up,
+                    num_trials,
+                    num_beams,
+                    batch_size):
+    from bigdl.llm.transformers import AutoModel, AutoModelForCausalLM
+    from transformers import AutoTokenizer, LlamaTokenizer
+
+    os.environ["BIGDL_OPT_IPEX"] = "true"
+
+    model_path = get_model_path(repo_id, local_model_hub)
+
+    st = time.perf_counter()
+    if repo_id in CHATGLM_IDS:
+        model = AutoModel.from_pretrained(model_path, load_in_low_bit='sym_int8', trust_remote_code=True, torch_dtype='auto',
+                                          use_cache=True, torchscript=True)
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    elif repo_id in LLAMA_IDS:
+        model = AutoModelForCausalLM.from_pretrained(model_path, load_in_low_bit='sym_int8', trust_remote_code=True, torch_dtype='auto',
+                                                     use_cache=True, torchscript=True)
+        tokenizer = LlamaTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(model_path, load_in_low_bit='sym_int8', trust_remote_code=True, torch_dtype='auto',
+                                                     use_cache=True, torchscript=True)
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    if not hasattr(model.config, "token_latency"):
+        model.config.token_latency = True
+    end = time.perf_counter()
+    load_time = end - st
+    print(">> loading of model costs {}s".format(load_time))
+
+    result = {}
+    with torch.inference_mode(), torch.autocast("cpu"):
+        for in_out in in_out_pairs:
+            in_out_len = in_out.split("-")
+            in_len = int(in_out_len[0])
+            out_len = int(in_out_len[1])
+            # As different tokenizer has different encodings,
+            # in_len.txt maybe shorter than we need,
+            # use much longer context to make sure input length
+            test_length = min(in_len*2, 8192)
+            while test_length not in [32, 256, 1024, 2048, 8192]:
+                test_length = test_length * 2
+            input_str = open(f"prompt/{test_length}.txt", 'r').read()
+            # As different tokenizer has different encodings,
+            # slice the input_ids to ensure the prompt length is required length.
+            input_ids = tokenizer.encode(input_str, return_tensors="pt")
+            input_ids = input_ids[:, :in_len]
+            true_str = tokenizer.batch_decode(input_ids)[0]
+            input_list = [true_str] * batch_size
+            input_ids = tokenizer(input_list, return_tensors="pt").input_ids
+            actual_in_len = input_ids.shape[1]
+            result[in_out] = []
+            for i in range(num_trials + warm_up):
+                st = time.perf_counter()
+                output_ids, total_list = model.generate(input_ids, do_sample=False, max_new_tokens=out_len,
+                                            num_beams=num_beams)
+                end = time.perf_counter()
+                print("model generate cost: " + str(end - st))
+                output = tokenizer.batch_decode(output_ids)
+                print(output[0])
+                actual_out_len = output_ids.shape[1] - actual_in_len
+                if i >= warm_up:
+                    result[in_out].append([total_list[0], np.mean(total_list[1:]), 0,
+                                          actual_in_len, actual_out_len, load_time])
+    return result
+
+
+def run_deepspeed_optimize_model_gpu(repo_id,
+                                     local_model_hub,
+                                     in_out_pairs,
+                                     warm_up,
+                                     num_trials,
+                                     num_beams,
+                                     low_bit,
+                                     batch_size):
+    def get_int_from_env(env_keys, default):
+        for e in env_keys:
+            val = int(os.environ.get(e, -1))
+            if val >= 0:
+                return val
+        return int(default)
+    local_rank = get_int_from_env(["LOCAL_RANK","PMI_RANK"], "0")
+    world_size = get_int_from_env(["WORLD_SIZE","PMI_SIZE"], "1")
+    os.environ["RANK"] = str(local_rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ["MASTER_PORT"] = os.environ.get("MASTER_PORT", "29500")
+
+    from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer, GPTJForCausalLM, LlamaTokenizer
+    from bigdl.llm import optimize_model
+    import intel_extension_for_pytorch as ipex
+    import deepspeed
+    from deepspeed.accelerator.cpu_accelerator import CPU_Accelerator
+    from deepspeed.accelerator import set_accelerator, get_accelerator
+    from intel_extension_for_deepspeed import XPU_Accelerator
+
+    model_path = get_model_path(repo_id, local_model_hub)
+    print('model_path:', model_path)
+    # First use CPU as accelerator
+    # Convert to deepspeed model and apply bigdl-llm optimization on CPU to decrease GPU memory usage
+    current_accel = CPU_Accelerator()
+    set_accelerator(current_accel)
+    st = time.perf_counter()
+    if repo_id in CHATGLM_IDS:
+        model = AutoModel.from_pretrained(model_path, device_map={"": "cpu"}, low_cpu_mem_usage=True,
+                                          torch_dtype=torch.float16, trust_remote_code=True, use_cache=True).eval()
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    elif repo_id in LLAMA_IDS:
+        model = AutoModelForCausalLM.from_pretrained(model_path, device_map={"": "cpu"}, low_cpu_mem_usage=True,
+                                                     torch_dtype=torch.float16, trust_remote_code=True, use_cache=True).eval()
+        tokenizer = LlamaTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(model_path, device_map={"": "cpu"}, low_cpu_mem_usage=True,
+                                                     torch_dtype=torch.float16, trust_remote_code=True, use_cache=True).eval()
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    model = deepspeed.init_inference(model, mp_size=world_size,
+                                     dtype=torch.float16, replace_method="auto",)
+    end = time.perf_counter()
+    load_time = end - st
+    print(">> loading of model costs {}s".format(load_time))
+
+    # Use bigdl-llm `optimize_model` to convert the model into optimized low bit format
+    # Convert the rest of the model into float16 to reduce allreduce traffic
+    model = optimize_model(model.module.to(f'cpu'), low_bit=low_bit).to(torch.float16)
+    # Next, use XPU as accelerator to speed up inference
+    current_accel = XPU_Accelerator()
+    set_accelerator(current_accel)
+    # Move model back to xpu
+    model = model.to(f'xpu:{local_rank}')
+
+    # Modify backend related settings 
+    if world_size > 1:
+        get_accelerator().set_device(local_rank)
+    dist_backend = get_accelerator().communication_backend_name()
+    import deepspeed.comm.comm
+    deepspeed.comm.comm.cdb = None
+    from deepspeed.comm.comm import init_distributed
+    init_distributed()
+
+    model = BenchmarkWrapper(model)
+
+    result = {}
+    with torch.inference_mode():
+        for in_out in in_out_pairs:
+            in_out_len = in_out.split("-")
+            in_len = int(in_out_len[0])
+            out_len = int(in_out_len[1])
+            # As different tokenizer has different encodings,
+            # in_len.txt maybe shorter than we need,
+            # use much longer context to make sure input length
+            test_length = min(in_len*2, 8192)
+            while test_length not in [32, 256, 1024, 2048, 8192]:
+                test_length = test_length * 2
+            input_str = open(f"prompt/{test_length}.txt", 'r').read()
+            # As different tokenizer has different encodings,
+            # slice the input_ids to ensure the prompt length is required length.
+            input_ids = tokenizer.encode(input_str, return_tensors="pt")
+            input_ids = input_ids[:, :in_len]
+            true_str = tokenizer.batch_decode(input_ids)[0]
+            input_list = [true_str] * batch_size
+            input_ids = tokenizer(input_list, return_tensors="pt").input_ids.to(f'xpu:{local_rank}')
+            actual_in_len = input_ids.shape[1]
+            result[in_out] = []
+            for i in range(num_trials + warm_up):
+                st = time.perf_counter()
+                output_ids = model.generate(input_ids, do_sample=False, max_new_tokens=out_len,
+                                            num_beams=num_beams)
+                torch.xpu.synchronize()
+                end = time.perf_counter()
+                output_ids = output_ids.cpu()
+                print("model generate cost: " + str(end - st))
+                output = tokenizer.batch_decode(output_ids)
+                actual_out_len = output_ids.shape[1] - actual_in_len
+                print(output[0])
+                if i >= warm_up:
+                    result[in_out].append([model.first_cost, model.rest_cost_mean, model.encoder_time,
+                                           actual_in_len, actual_out_len, load_time])
+    del model
+    torch.xpu.empty_cache()
+    return result
+
 
 if __name__ == '__main__':
     from omegaconf import OmegaConf

@@ -145,6 +145,10 @@ class _BaseAutoModelClass:
         invalidInputError(model_hub in ["huggingface", "modelscope"],
                           "The parameter `model_hub` is supposed to be `huggingface` or "
                           f"`modelscope`, but got {model_hub}.")
+        invalidInputError(not (kwargs.get('device_map') and 'xpu' in kwargs['device_map']),
+                          "Please do not use `device_map` "
+                          "with `xpu` value as an argument. "
+                          "Use model.to('xpu') instead.")
         if model_hub == "huggingface":
             config_dict, _ = PretrainedConfig.get_config_dict(pretrained_model_name_or_path)
         elif model_hub == "modelscope":
@@ -315,7 +319,8 @@ class _BaseAutoModelClass:
         return model
 
     @staticmethod
-    def from_gguf(fpath: str, optimize_model: bool = True, cpu_embedding: bool = False):
+    def from_gguf(fpath: str, optimize_model: bool = True,
+                  cpu_embedding: bool = False, low_bit: str = "sym_int4"):
         """
         Load gguf model and tokenizer and convert it to bigdl-llm model and huggingface tokenzier
 
@@ -328,7 +333,7 @@ class _BaseAutoModelClass:
         """
         from bigdl.llm.optimize import optimize_model as optimize_model_fn
 
-        model, tokenizer, low_bit = load_gguf_model(fpath, dtype=torch.half)
+        model, tokenizer = load_gguf_model(fpath, dtype=torch.half, low_bit=low_bit)
         model = optimize_model_fn(model, low_bit=low_bit, optimize_llm=optimize_model,
                                   cpu_embedding=cpu_embedding)
         return model, tokenizer

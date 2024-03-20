@@ -246,6 +246,16 @@ def ggml_convert_fp32(tensor: torch.Tensor, weight_shape: tuple, k: int, qtype: 
     return dst_tensor
 
 
+def reshape_lm_head_input(x):
+    if x.dim() > 3:
+        x = x.reshape([-1, x.shape[-2], x.shape[-1]])
+    shape = list(x.size())
+    if shape[1] > 10:
+        shape[1] = 1
+        x = x[:, -1, :].view(shape)
+    return x
+
+
 # Rename to FP4Params to trigger initializing
 # the params layer with all parameters on the CPU
 # https://github.com/huggingface/accelerate/blob/main/src/accelerate/utils/modeling.py#L333
@@ -505,7 +515,8 @@ class MatMulLowBitCPU(torch.autograd.Function):
 
 class LowBitLinear(nn.Linear):
     def __init__(self, input_features, output_features, qtype, bias=True,
-                 conver_to_half=True, mp_group=None, enable_xetla=False):
+                 conver_to_half=True, mp_group=None, enable_xetla=False,
+                 optimize_lm_head=False):
         super().__init__(input_features, output_features, bias)
         self.weight = FP4Params(self.weight.data,
                                 requires_grad=False,
@@ -520,8 +531,22 @@ class LowBitLinear(nn.Linear):
         self.mp_group = mp_group
         self.compute_dtype = None  # only for training
         self.enable_xetla = enable_xetla
+        self.optimize_lm_head = optimize_lm_head
+        self.device = None  # detected only once in the first forward
+        # empty cache before and after lm_head at first token (by default on arc) for models
+        # with large vocabulary (e.g. baichuan/qwen) when given long input at inference time.
+        # The condition makes sure that empty cache only takes effect if this layer is lm_head.
+        # TODO: may modify the value constraints for other models.
+        self.low_memory_mode = self.in_len * self.out_len >= 70000*4096
 
     def forward(self, x: torch.Tensor):
+        # empty cache before and after lm_head at first token when input > 1024
+        # on arc or BIGDL_LOW_MEMORY_MODE is set to 1 at inference time.
+        if self.device is None:
+            self.device = get_xpu_device_type(self.weight.data)
+            self.low_memory_mode = \
+                self.low_memory_mode and\
+                (self.device == "arc" or os.environ.get("BIGDL_LOW_MEMORY_MODE", None) == "1")
         # Due to inconsistent training status in some models like Baichuan-7b-Chat,
         # we should check both self.training and torch.is_inference_mode_enabled().
         is_training = self.training and not torch.is_inference_mode_enabled()
@@ -535,6 +560,9 @@ class LowBitLinear(nn.Linear):
 
         if self.bias is not None and self.bias.dtype != x.dtype:
             self.bias.data = self.bias.data.to(x.dtype)
+
+        if self.optimize_lm_head:
+            x = reshape_lm_head_input(x)
 
         # [batch, input_num, in_len]
         # input_num == token num for Transformer
@@ -584,6 +612,10 @@ class LowBitLinear(nn.Linear):
                 # current workaround to reduce first token latency of fp32 input
                 # sometimes fp16 cause nan and training instability
                 # disable the conversion when training
+                # TODO: may modify the input length condition for empty cache.
+                do_empty_cache = self.low_memory_mode and x_2d.shape[0] >= 1024
+                if do_empty_cache:
+                    torch.xpu.empty_cache()
                 if self.conver_to_half and x_2d.shape[0] > 1 and x_2d.dtype == torch.float32 and \
                         not use_xmx(x_2d, self.weight.qtype):
                     x_2d = x_2d.half()
@@ -593,6 +625,8 @@ class LowBitLinear(nn.Linear):
                 else:
                     result = linear_q4_0.forward_new(x_2d, self.weight.data, self.weight.qtype,
                                                      input_seq_size)
+                if do_empty_cache:
+                    torch.xpu.empty_cache()
             result = result.view(new_shape)
             if self.mp_group is not None:
                 from deepspeed import comm as dist
@@ -632,7 +666,8 @@ class LowBitLinear(nn.Linear):
 
 class FP16Linear(nn.Linear):
     def __init__(self, input_features, output_features, bias=True,
-                 mp_group=None, weight_type=1):
+                 mp_group=None, weight_type=1,
+                 optimize_lm_head=False):
         super().__init__(input_features, output_features, bias)
         self.in_len = input_features
         self.out_len = output_features
@@ -644,11 +679,15 @@ class FP16Linear(nn.Linear):
         # weigh_type = 2 means weight has been transposed
         # weigh_type = 3 means weight has been transposed by esimd method
         self.weight_type = 1
+        self.optimize_lm_head = optimize_lm_head
 
     def forward(self, x: torch.Tensor):
         # only work for GPU
         invalidInputError(x.device.type == "xpu",
                           "FP16Linear only works for Intel GPUs")
+        if self.optimize_lm_head:
+            x = reshape_lm_head_input(x)
+
         x = x.to(torch.float16)
         if self.bias is not None and self.bias.dtype != x.dtype:
                 self.bias.data = self.bias.data.to(x.dtype)
@@ -743,7 +782,8 @@ class FP16Linear(nn.Linear):
 
 class BF16Linear(nn.Linear):
     def __init__(self, input_features, output_features, bias=True,
-                 mp_group=None, compute_dtype=None):
+                 mp_group=None, compute_dtype=None,
+                 optimize_lm_head=False):
         super().__init__(input_features, output_features, bias)
         self.in_len = input_features
         self.out_len = output_features
@@ -752,8 +792,12 @@ class BF16Linear(nn.Linear):
         self.qtype = ggml_tensor_qtype["bf16"]
         self.mp_group = mp_group
         self.compute_dtype = compute_dtype
+        self.optimize_lm_head = optimize_lm_head
 
     def forward(self, x: torch.Tensor):
+        if self.optimize_lm_head:
+            x = reshape_lm_head_input(x)
+
         x = x.to(torch.bfloat16)
         if self.weight is not None and self.weight.dtype != x.dtype:
             self.weight.data = self.weight.data.to(x.dtype)

@@ -24,12 +24,13 @@ import time
 import os
 import copy
 import logging
-import warnings
-import inspect
+import transformers
+from packaging import version
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 from transformers import top_k_top_p_filtering, GenerationConfig, \
     LogitsProcessorList, StoppingCriteriaList
 from bigdl.llm.utils.common import invalidInputError
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 # patch GenerationMixin.generate
 from transformers import GenerationMixin
@@ -367,6 +368,55 @@ def _update_past_key_values_storage_cpu(self, past_key_values, past_key_values_s
                     delta_past_value.to(torch.float32)
 
 
+def _check_and_extend_kv_cache(past_key_values, max_step_draft, kv_alloc_block_len=256,
+                               model_type="llama"):
+    from bigdl.llm.transformers.models.utils import is_enough_kv_cache_room_4_31, \
+        extend_kv_cache
+    enough_kv_room = True
+    if model_type not in ["chatglm", "qwen", "baichuan", "llama", "mistral",
+                          "gptj", "opt"]:
+        return past_key_values, False
+    cache_k = past_key_values[0][0]
+    if model_type == "chatglm":
+        cache_k = cache_k.permute(1, 2, 0, 3)
+    elif model_type == "qwen":
+        cache_k = cache_k.transpose(1, 2)
+
+    enough_kv_room = is_enough_kv_cache_room_4_31(past_key_value=(cache_k, None),
+                                                  seq_len=max_step_draft)
+    bsz, num_heads, current_seq_len, head_dim = cache_k.shape
+    device = past_key_values[0][0].device
+    if not enough_kv_room:
+        past_key_values = list(past_key_values)
+        for i in range(len(past_key_values)):
+            cache_k = past_key_values[i][0]
+            cache_v = past_key_values[i][1]
+            if model_type == "chatglm":
+                cache_k = cache_k.permute(1, 2, 0, 3)
+                cache_v = cache_v.permute(1, 2, 0, 3)
+            elif model_type == "qwen":
+                cache_k = cache_k.transpose(1, 2)
+                cache_v = cache_v.transpose(1, 2)
+            new_cache_k, new_cache_v = extend_kv_cache(
+                bsz,
+                num_heads,  # Support GQA
+                head_dim,
+                cache_k.size(2),
+                current_seq_len + max_step_draft + kv_alloc_block_len,
+                dtype=cache_v.dtype,
+                device=device)
+            new_cache_k[:] = cache_k
+            new_cache_v[:] = cache_v
+            if model_type == "chatglm":
+                past_key_values[i] = (new_cache_k.permute(2, 0, 1, 3),
+                                      new_cache_v.permute(2, 0, 1, 3))
+            elif model_type == "qwen":
+                past_key_values[i] = (new_cache_k.transpose(1, 2), new_cache_v.transpose(1, 2))
+            else:
+                past_key_values[i] = (new_cache_k, new_cache_v)
+    return past_key_values, not enough_kv_room
+
+
 @torch.no_grad()
 def speculative_generate(self,
                          inputs: Optional[torch.Tensor] = None,
@@ -484,15 +534,16 @@ def speculative_generate(self,
     past_key_values = None
     past_key_values_storage = []
 
-    _enable_ipex = os.getenv("BIGDL_OPT_IPEX")
-    _enable_ipex = (_enable_ipex is not None) and (_enable_ipex.lower() == "true")
+    from bigdl.llm.transformers.convert import get_enable_ipex
+    _enable_ipex = get_enable_ipex()
+
     if _enable_ipex:
         if not ((self.config.model_type == 'baichuan') or
                 ('llama' in self.config.model_type) or
                 ("mistral" in self.config.model_type) or
                 ("qwen" in self.config.model_type) or
                 ("chatglm" in self.config.model_type)):
-            invalidInputError(False, "BigDL Speculative Decoding with IPEX BF16 only supports \
+            invalidInputError(False, "BigDL Speculative Decoding with IPEX only supports \
                               Llama, Baichuan2, Mistral, ChatGLM and Qwen models currently.")
         if "chatglm" in self.config.model_type:
             global query_group_size
@@ -503,6 +554,9 @@ def speculative_generate(self,
     e2e_tic = 0.0
 
     self.clear_benchmarks()
+
+    if self.device.type == 'xpu':
+        torch.xpu.empty_cache()
 
     # Example:
     # Target model forward for the first token
@@ -527,6 +581,11 @@ def speculative_generate(self,
                           attention_mask=attention_mask,
                           return_dict=True,
                           use_cache=True)
+            if _enable_ipex:
+                output = CausalLMOutputWithPast(
+                    logits=output[0],
+                    past_key_values=output[1],
+                )
             logits = output['logits']
             logits = logits[:, -1:]
             logits[:, -1, :] = logits_processor(current_input_ids, logits[:, -1, :])
@@ -552,16 +611,23 @@ def speculative_generate(self,
 
             if self.device.type == 'cpu':
                 # init past_key_values_storage and assign initial fp32 value
-                if step == 1:
-                    past_key_values_storage = \
-                        _prepare_past_key_values_storage_cpu(self, past_key_values,
-                                                             max_new_tokens, _enable_ipex)
-                # each iter cut off cur_len kv_cache from past_key_values1
-                draft_past_key_values = \
-                    _prepare_draft_past_key_values_cpu(self, past_key_values,
-                                                       past_key_values_storage,  _enable_ipex)
-                original_draft_past_key_values = draft_past_key_values
+                if _enable_ipex:
+                    draft_past_key_values = past_key_values
+                else:
+                    if step == 1:
+                        past_key_values_storage = \
+                            _prepare_past_key_values_storage_cpu(self, past_key_values,
+                                                                 max_new_tokens, _enable_ipex)
+                    # each iter cut off cur_len kv_cache from past_key_values1
+                    draft_past_key_values = \
+                        _prepare_draft_past_key_values_cpu(self, past_key_values,
+                                                           past_key_values_storage,  _enable_ipex)
+                    original_draft_past_key_values = draft_past_key_values
             else:
+                past_key_values, extend_kv = _check_and_extend_kv_cache(past_key_values,
+                                                                        max_step_draft,
+                                                                        max_new_tokens - step + 40,
+                                                                        self.config.model_type)
                 draft_past_key_values = past_key_values
             draft_generate_ids[:, 0] = current_input_ids
             draft_prob_list = []
@@ -596,7 +662,57 @@ def speculative_generate(self,
                     past_length = draft_past_key_values[0][0].size(2)
                     position_ids = torch.Tensor([[past_length]]).long().to(self.device)
                     forward_args["position_ids"] = position_ids
-                draft_output = draft_model(**forward_args)
+
+                if _enable_ipex:
+                    if any(keyword in self.config.model_type
+                            for keyword in ["llama", "chatglm", "mistral"]):
+                        past_key_value_len = draft_past_key_values[0][0].shape[2]
+                        position_ids = torch.Tensor([[past_key_value_len + step_draft]]).long()
+                        position_ids = position_ids[:, :-draft_current_input_ids.size(0)]
+                        draft_output = draft_model.trace_graph(
+                            input_ids=draft_current_input_ids,
+                            attention_mask=draft_attention_mask,
+                            position_ids=position_ids,
+                            past_key_values=draft_past_key_values,
+                        )
+                    elif self.config.model_type == "baichuan":
+                        if self.config.hidden_size == 4096:
+                            past_key_value_len = draft_past_key_values[0][0].shape[2]
+                            seq_len = draft_current_input_ids.shape[1]
+                            seq_len_with_past = seq_len + past_key_value_len
+                            position_ids = torch.arange(past_key_value_len,
+                                                        seq_len_with_past,
+                                                        dtype=torch.long,
+                                                        device=draft_current_input_ids.device)
+                            position_ids = position_ids.unsqueeze(0).view(-1, seq_len)
+                            draft_output = draft_model.trace_graph(
+                                input_ids=draft_current_input_ids,
+                                attention_mask=draft_attention_mask,
+                                position_ids=position_ids,
+                                past_key_values=draft_past_key_values,
+                            )
+                        elif self.config.hidden_size == 5120:
+                            draft_output = draft_model.trace_graph(
+                                input_ids=draft_current_input_ids,
+                                attention_mask=draft_attention_mask,
+                                past_key_values=draft_past_key_values,
+                            )
+                    elif "qwen" in self.config.model_type:
+                        draft_output = draft_model.trace_graph(
+                            input_ids=draft_current_input_ids,
+                            attention_mask=draft_attention_mask,
+                            past_key_values=draft_past_key_values,
+                        )
+                    else:
+                        invalidInputError(False, "BigDL Speculative Decoding with IPEX only supports \
+                              Llama, Baichuan2, Mistral, ChatGLM and Qwen models currently.")
+
+                    draft_output = CausalLMOutputWithPast(
+                        logits=draft_output[0],
+                        past_key_values=draft_output[1],
+                    )
+                else:
+                    draft_output = draft_model(**forward_args)
                 temp_input_ids = torch.cat((input_ids, generate_ids[:, :step],
                                             draft_generate_ids[:, 1:step_draft+1]), dim=-1)
                 logits = draft_output['logits']
@@ -742,6 +858,8 @@ def speculative_generate(self,
                 output_ids = greedy(logits)
             if self.device.type == 'xpu':
                 torch.xpu.synchronize()
+                if extend_kv:
+                    torch.xpu.empty_cache()
             toc = time.time()
             self.verify_time.append(toc - tic)
             self.generate_time.append(self.draft_time[-1] + self.verify_time[-1])
@@ -790,7 +908,6 @@ def speculative_generate(self,
             # Clean up target model KV cache
             if max_of_max_matched != max_matched:
                 output_ids = output_ids[:, :max_matched]
-                # For Qwen
                 if _enable_ipex:
                     cur_len = past_key_values[0][0].size(1)
                     delta = max_of_max_matched - max_matched
@@ -832,7 +949,7 @@ def speculative_generate(self,
                         ]
 
             # Each iter assign new_matched kv_cache to past_key_values1
-            if self.device.type == 'cpu':
+            if self.device.type == 'cpu' and (not _enable_ipex):
                 _update_past_key_values_storage_cpu(self, past_key_values, past_key_values_storage,
                                                     original_draft_past_key_values,
                                                     _enable_ipex)
